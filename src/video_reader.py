@@ -2,50 +2,76 @@
 Video Reader Module
 ===================
 
-Modul ini menangani pembacaan video dari file.
+Modul ini menangani pembacaan video dari file ATAU webcam.
 Menggunakan OpenCV VideoCapture untuk membaca frame per frame.
 
 Konsep Penting:
 - Video adalah urutan gambar (frame) yang ditampilkan dengan kecepatan tertentu (FPS)
 - Setiap frame adalah array numpy dengan shape (height, width, channels)
 - Format warna default OpenCV adalah BGR, bukan RGB
+- Webcam dapat diakses dengan index (0, 1, 2...) atau path device
 """
 
 import cv2
 import numpy as np
-from typing import Optional, Tuple, Generator
+from typing import Optional, Tuple, Generator, Union
 
 
 class VideoReader:
     """
-    Kelas untuk membaca video dari file.
+    Kelas untuk membaca video dari file atau webcam.
     
     Menggunakan context manager (with statement) untuk memastikan
     resource video selalu di-release dengan benar.
     
     Contoh penggunaan:
     -----------------
+    >>> # Dari file video
     >>> with VideoReader("video.mp4") as reader:
+    ...     for frame in reader.frames():
+    ...         process(frame)
+    
+    >>> # Dari webcam
+    >>> with VideoReader(0) as reader:  # 0 = webcam default
     ...     for frame in reader.frames():
     ...         process(frame)
     """
     
-    def __init__(self, video_path: str):
+    def __init__(
+        self, 
+        source: Union[str, int],
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        fps: Optional[int] = None
+    ):
         """
         Inisialisasi VideoReader.
         
         Parameters
         ----------
-        video_path : str
-            Path ke file video (mp4, avi, mkv, dll)
+        source : Union[str, int]
+            Path ke file video (mp4, avi, mkv, dll) ATAU
+            Index webcam (0, 1, 2...) untuk kamera
+        width : Optional[int]
+            Lebar frame untuk webcam (default: 640)
+        height : Optional[int]
+            Tinggi frame untuk webcam (default: 480)
+        fps : Optional[int]
+            FPS untuk webcam (default: 30)
         """
-        self.video_path = video_path
+        self.source = source
+        self._is_webcam = isinstance(source, int)
         self.cap: Optional[cv2.VideoCapture] = None
+        
+        # Webcam settings
+        self._webcam_width = width or 640
+        self._webcam_height = height or 480
+        self._webcam_fps = fps or 30
         
     def __enter__(self) -> "VideoReader":
         """
         Dipanggil saat masuk blok 'with'.
-        Membuka koneksi ke file video.
+        Membuka koneksi ke file video atau webcam.
         """
         self.open()
         return self
@@ -56,23 +82,37 @@ class VideoReader:
         Memastikan video selalu di-release.
         """
         self.release()
+    
+    @property
+    def is_webcam(self) -> bool:
+        """Cek apakah sumber adalah webcam."""
+        return self._is_webcam
         
     def open(self) -> bool:
         """
-        Membuka file video.
+        Membuka file video atau webcam.
         
         Returns
         -------
         bool
             True jika berhasil membuka video, False jika gagal
         """
-        self.cap = cv2.VideoCapture(self.video_path)
+        self.cap = cv2.VideoCapture(self.source)
         
         if not self.cap.isOpened():
+            source_type = "webcam" if self._is_webcam else "video"
             raise FileNotFoundError(
-                f"Tidak dapat membuka video: {self.video_path}\n"
-                "Pastikan path benar dan format video didukung."
+                f"Tidak dapat membuka {source_type}: {self.source}\n"
+                "Pastikan path benar atau webcam terpasang."
             )
+        
+        # Konfigurasi webcam jika diperlukan
+        if self._is_webcam:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._webcam_width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._webcam_height)
+            self.cap.set(cv2.CAP_PROP_FPS, self._webcam_fps)
+            # Reduce buffer untuk latency rendah
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
         return True
     
@@ -98,6 +138,7 @@ class VideoReader:
         Penjelasan:
         - Frame adalah gambar dalam format BGR
         - Jika video sudah habis, ret akan False
+        - Untuk webcam, ret False biasanya berarti kamera disconnect
         """
         if self.cap is None:
             return False, None
@@ -131,15 +172,23 @@ class VideoReader:
         Mendapatkan Frame Per Second video.
         
         Digunakan untuk menghitung delay yang tepat saat menampilkan video.
+        Untuk webcam, mengembalikan nilai yang di-set atau aktual dari kamera.
         """
         if self.cap is None:
             return 0.0
-        return self.cap.get(cv2.CAP_PROP_FPS)
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        # Webcam kadang return 0, gunakan nilai default
+        if self._is_webcam and actual_fps <= 0:
+            return float(self._webcam_fps)
+        return actual_fps
     
     @property
     def frame_count(self) -> int:
-        """Total jumlah frame dalam video."""
-        if self.cap is None:
+        """
+        Total jumlah frame dalam video.
+        Untuk webcam, mengembalikan 0 (tidak terbatas).
+        """
+        if self.cap is None or self._is_webcam:
             return 0
         return int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
@@ -171,27 +220,38 @@ class VideoReader:
         dict
             Dictionary berisi metadata video
         """
-        return {
-            "path": self.video_path,
+        info = {
+            "source": str(self.source),
+            "is_webcam": self._is_webcam,
             "fps": self.fps,
-            "frame_count": self.frame_count,
             "width": self.width,
             "height": self.height,
-            "duration_seconds": self.frame_count / self.fps if self.fps > 0 else 0
         }
+        
+        if not self._is_webcam:
+            info["frame_count"] = self.frame_count
+            info["duration_seconds"] = self.frame_count / self.fps if self.fps > 0 else 0
+        else:
+            info["frame_count"] = "∞"
+            info["duration_seconds"] = "∞"
+            
+        return info
 
 
 # === Testing langsung (opsional) ===
 if __name__ == "__main__":
     import sys
     
+    # Default ke webcam jika tidak ada argument
     if len(sys.argv) < 2:
-        print("Usage: python video_reader.py <path_to_video>")
-        sys.exit(1)
-        
-    video_path = sys.argv[1]
+        print("No argument provided. Using webcam (index 0)...")
+        source = 0
+    else:
+        arg = sys.argv[1]
+        # Cek apakah argument adalah angka (webcam index)
+        source = int(arg) if arg.isdigit() else arg
     
-    with VideoReader(video_path) as reader:
+    with VideoReader(source) as reader:
         print("Video Info:")
         for key, value in reader.get_info().items():
             print(f"  {key}: {value}")
@@ -202,8 +262,9 @@ if __name__ == "__main__":
             cv2.imshow("Video", frame)
             
             # Tunggu sesuai FPS
-            delay = int(1000 / reader.fps)
+            delay = max(1, int(1000 / reader.fps)) if reader.fps > 0 else 30
             if cv2.waitKey(delay) & 0xFF == ord('q'):
                 break
                 
         cv2.destroyAllWindows()
+
